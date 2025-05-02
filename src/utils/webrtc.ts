@@ -1,4 +1,9 @@
-import Peer from 'simple-peer';
+// import PeerFactory, { Instance as PeerInstance } from 'simple-peer';
+// // simple‑peer ships as a CommonJS module when esModuleInterop is off,
+// // so grab the constructor off `.default` if it’s there
+// const Peer: typeof PeerFactory = (PeerFactory as { default?: typeof PeerFactory }).default || PeerFactory;
+import SimplePeer, { Instance as PeerInstance, SignalData } from 'simple-peer';
+const Peer = SimplePeer;
 import { Socket } from 'socket.io-client';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -29,26 +34,21 @@ export interface TransferProgress {
 
 const CHUNK_SIZE = 16 * 1024; // 16KB chunks
 
-export function createPeer(initiator: boolean, socket: Socket, recipientId: string): Peer.Instance {
-  // Create a WebRTC peer
-  const peer = new Peer({
-    initiator,
-    trickle: true,
+export function createPeer(
+  initiator: boolean,
+  socket: Socket,
+  roomId: string
+): PeerInstance {
+  const peer = new Peer({ initiator, trickle: true });
+
+  // send our SDP/ICE out to the room
+  peer.on('signal', (signalData) => {
+    socket.emit('signal', { to: roomId, signal: signalData });
   });
 
-  // Handle ICE candidates
-  peer.on('signal', (data) => {
-    socket.emit('signal', {
-      to: recipientId,
-      signal: data,
-    });
-  });
-
-  // Handle socket signals
-  socket.on('signal', (data) => {
-    if (data.from === recipientId) {
-      peer.signal(data.signal);
-    }
+  // accept all incoming signaling messages from the room
+  socket.on('signal', (data: { from: string; signal: SignalData }) => {
+    peer.signal(data.signal);
   });
 
   return peer;
@@ -82,7 +82,7 @@ export async function prepareFileForTransfer(file: File): Promise<{
 }
 
 export function sendFileViaPeer(
-  peer: Peer.Instance,
+  peer: PeerInstance,
   metadata: FileMetadata,
   chunks: ArrayBuffer[],
   onProgress: (progress: TransferProgress) => void
@@ -148,7 +148,7 @@ export function sendFileViaPeer(
 }
 
 export function setupFileReceiver(
-  peer: Peer.Instance,
+  peer: PeerInstance,
   onProgress: (progress: TransferProgress) => void,
   onComplete: (transferId: string, file: Blob) => void
 ): void {

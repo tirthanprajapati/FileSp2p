@@ -1,24 +1,39 @@
 import axios from 'axios';
 
-// Create an axios instance with defaults
+const raw = import.meta.env.VITE_API_URL as string | undefined;
+
+// trim and remove trailing slash, then append /api
+const base =
+  raw?.trim().replace(/\/$/, '')?.concat('/api') ??
+  'http://localhost:3001/api';
+
 export const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || 'http://localhost:3001/api',
+  baseURL: base,
   headers: {
     'Content-Type': 'application/json',
   },
-  withCredentials: true, // Important for cookies/auth
+  withCredentials: true,
 });
-
-// Response interceptor for handling common errors
 api.interceptors.response.use(
-  (response) => response,
-  (error) => {
-    // Handle 401 Unauthorized globally
-    if (error.response && error.response.status === 401) {
-      // Redirect to login or clear local auth state
+  (res) => res,
+  (err) => {
+    const status = err.response?.status;
+    const path = window.location.pathname;
+    const reqUrl = err.config?.url ?? '';
+
+    // don't redirect if
+    //  • it's not a 401
+    //  • we're already on /login
+    //  • this request was the login call itself
+    if (
+      status === 401 &&
+      path !== '/login' &&
+      !reqUrl.endsWith('/auth/login')
+    ) {
       window.location.href = '/login';
     }
-    return Promise.reject(error);
+
+    return Promise.reject(err);
   }
 );
 

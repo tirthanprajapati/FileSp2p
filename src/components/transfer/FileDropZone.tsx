@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useState, useRef } from 'react';
 import { Upload, FileIcon, X } from 'lucide-react';
 import Button from '../ui/Button';
 
@@ -17,6 +17,7 @@ const FileDropZone: React.FC<FileDropZoneProps> = ({
   accept,
   disabled = false,
 }) => {
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
@@ -144,6 +145,7 @@ const FileDropZone: React.FC<FileDropZoneProps> = ({
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
+        onClick={() => !disabled && fileInputRef.current?.click()}       // <— trigger dialog on click
       >
         <div className="flex flex-col items-center justify-center text-center">
           <Upload
@@ -161,6 +163,7 @@ const FileDropZone: React.FC<FileDropZoneProps> = ({
           
           <div className="mt-4">
             <input
+              ref={fileInputRef}                                         // <— attach ref
               id="file-upload"
               type="file"
               multiple={multiple}
@@ -168,16 +171,17 @@ const FileDropZone: React.FC<FileDropZoneProps> = ({
               onChange={handleFileInputChange}
               disabled={disabled}
               className="sr-only"
+              // webkitdirectory="true"                                      // <— enable folder select
+              // directory="true"                                             // <— enable folder select
             />
             <label htmlFor="file-upload">
               <Button
-                type="button"
-                as="span"
-                disabled={disabled}
-                variant="outline"
-              >
-                Browse files
-              </Button>
+                  type="button"
+                  disabled={disabled}
+                  variant="outline"
+                >
+                  Browse files
+                </Button>
             </label>
           </div>
           

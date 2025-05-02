@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Send, Link as LinkIcon, CheckCircle, Copy, Zap } from 'lucide-react';
+import { Link as LinkIcon, CheckCircle, Copy, Zap } from 'lucide-react';
 import Button from '../components/ui/Button';
 import Input from '../components/ui/Input';
 import FileDropZone from '../components/transfer/FileDropZone';
