@@ -1,21 +1,56 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { useParams } from 'react-router-dom';
 import { Download, Shield, Loader, CheckCircle, AlertTriangle } from 'lucide-react';
 import Button from '../components/ui/Button';
+import Input from '../components/ui/Input';
 import TransferProgress from '../components/transfer/TransferProgress';
 import { useSocket } from '../context/SocketContext';
-import { createPeer, setupFileReceiver, TransferProgress as TransferProgressType } from '../utils/webrtc';
+import { useAuth } from '../context/AuthContext';
+import { TransferProgress as TransferProgressType } from '../utils/webrtc';
+
+// Define the receive state type
+type ReceiveState = {
+  status: 'idle' | 'connecting' | 'connected' | 'error' | 'completed';
+  error: string | null;
+};
+
+interface FileShareState {
+  metadata: {
+    filename: string;
+    total_buffer_size: number;
+    buffer_size: number;
+    senderUid: string;
+    sessionId: string;
+    type?: string;
+  };
+  transmitted: number;
+  buffer: Uint8Array[];
+  sessionId?: string;
+}
 
 const ReceivePage: React.FC = () => {
-  const { id } = useParams<{ id: string }>();
-  const { socket, connected } = useSocket();
+  const { id: urlTransferId } = useParams<{ id: string }>();
+  const [transferCode, setTransferCode] = useState<string>(urlTransferId || '');
+  const { socket } = useSocket();
+  const { user } = useAuth();
   const [isConnecting, setIsConnecting] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [transfers, setTransfers] = useState<TransferProgressType[]>([]);
-  const [error, setError] = useState<string | null>(null);
   const [completedFiles, setCompletedFiles] = useState<{ id: string; blob: Blob; name: string; type: string }[]>([]);
+  const [receiveState, setReceiveState] = useState<ReceiveState>({
+    status: 'idle',
+    error: null
+  });
   
-  const updateTransferProgress = (progress: TransferProgressType) => {
+  // The transfer ID to use (from URL or input field)
+  const transferId = urlTransferId !== 'guest' ? urlTransferId : transferCode;
+  
+  // File share state reference for Socket.IO based transfers
+  const fileShare = useRef<Record<string, FileShareState>>({});
+  const receiverUID = useRef<string>('');
+  
+  // Update transfer progress in the UI
+  const updateTransferProgress = useCallback((progress: TransferProgressType) => {
     setTransfers(prevTransfers => {
       // If this transfer is not in the list yet, add it
       const exists = prevTransfers.some(t => t.transferId === progress.transferId);
@@ -28,74 +63,257 @@ const ReceivePage: React.FC = () => {
         transfer.transferId === progress.transferId ? progress : transfer
       );
     });
-  };
+  }, []);
   
-  const handleFileReceived = (transferId: string, blob: Blob) => {
-    // Mark the transfer as completed
+  // Handler for completed file reception
+  const handleFileReceived = useCallback((transferId: string, blob: Blob) => {
+    console.log(`File received: ${transferId}, size: ${blob.size}`);
+    
+    // Find the transfer in our list
+    const transfer = transfers.find(t => t.transferId === transferId);
+    
+    // Update transfer progress to completed
     updateTransferProgress({
       transferId,
-      sentChunks: 0,
-      receivedChunks: 0,
-      totalChunks: 0,
+      sentChunks: transfer?.totalChunks || 0,
+      receivedChunks: transfer?.totalChunks || 0,
+      totalChunks: transfer?.totalChunks || 0,
       status: 'completed',
+      metadata: transfer?.metadata
     });
     
-    // Get the metadata for this transfer
-    const transfer = transfers.find(t => t.transferId === transferId);
-    if (transfer?.metadata) {
-      // Add to completed files
-      setCompletedFiles(prev => [
-        ...prev, 
-        { 
-          id: transferId,
-          blob,
-          name: transfer.metadata?.name || 'unknown-file',
-          type: transfer.metadata?.type || 'application/octet-stream',
-        }
-      ]);
-    }
-  };
-  
-  const connectToSender = () => {
-    if (!socket || !connected || !id) {
-      setError('Cannot connect to the transfer. Please try again later.');
+    // Add to completed files with proper metadata
+    const fileName = transfer?.metadata?.name || 
+                    Object.values(fileShare.current).find(fs => fs.metadata.filename)?.metadata.filename || 
+                    'unknown';
+    
+    const fileType = transfer?.metadata?.type || 
+                    Object.values(fileShare.current).find(fs => fs.metadata.type)?.metadata.type || 
+                    'application/octet-stream';
+    
+    setCompletedFiles(prev => [
+      ...prev, 
+      { 
+        id: transferId,
+        blob: blob,
+        name: fileName,
+        type: fileType,
+      }
+    ]);
+    
+    console.log(`Added file to completed files: ${fileName}`);
+  }, [transfers, updateTransferProgress]);
+
+  // Improved function to connect to sender with better error handling
+  const connectToSender = useCallback(async () => {
+    if (!transferId || !socket) {
+      setReceiveState({
+        status: 'error',
+        error: 'No transfer code provided or socket not connected'
+      });
       return;
     }
     
-    setIsConnecting(true);
-    setError(null);
-    
     try {
-      // Tell the server we're ready to receive
-      socket.emit('ready_to_receive', { transferId: id });
+      setReceiveState({
+        status: 'connecting',
+        error: null
+      });
+      setIsConnecting(true);
+      // Reset any existing state
+      fileShare.current = {};
       
-      // Create a WebRTC peer (not as initiator)
-      const peer = createPeer(false, socket, id);
+      // Clear existing listeners
+      socket.off("fs-meta");
+      socket.off("fs-share");
+      socket.off("sender-not-found");
+
+      // Generate unique receiver ID and store it
+      receiverUID.current = `${Math.trunc(Math.random()*999)}-${Math.trunc(Math.random()*999)}-${Math.trunc(Math.random()*999)}`;
       
-      // Set up the file receiver
-      setupFileReceiver(peer, updateTransferProgress, handleFileReceived);
+      console.log(`Joining as receiver with ID: ${receiverUID.current} for sender: ${transferId}`);
       
-      // When connected to the peer
-      peer.on('connect', () => {
-        console.log('Connected to sender');
+      // Join as a receiver
+      socket.emit("receiver-join", { 
+        sender_uid: transferId, 
+        uid: receiverUID.current,
+        userId: user?.id || 'anonymous-user'
+      });
+
+      // Handle file metadata
+      socket.on("fs-meta", (metadata) => {
+        console.log("Received file metadata:", metadata);
+        
+        const sessionId = metadata.sessionId;
+        const transferId = metadata.transferId || metadata.filename;
+        
+        // Initialize file share state for this transfer
+        fileShare.current[transferId] = {
+          metadata,
+          transmitted: 0,
+          buffer: [],
+          sessionId
+        };
+        
+        // Update UI with initial progress
+        updateTransferProgress({
+          transferId,
+          sentChunks: 0,
+          totalChunks: Math.ceil(metadata.total_buffer_size / (metadata.buffer_size || 64 * 1024)),
+          receivedChunks: 0,
+          status: 'transferring',
+          metadata: {
+            id: transferId,
+            name: metadata.filename,
+            type: metadata.type || 'application/octet-stream',
+            size: metadata.total_buffer_size,
+            lastModified: Date.now()
+          }
+        });
+        
+        // Set connection as established
         setIsConnected(true);
         setIsConnecting(false);
+        setReceiveState({
+          status: 'connected',
+          error: null
+        });
+        
+        console.log(`Requesting first chunk for ${metadata.filename} with session ID: ${sessionId}`);
+        
+        // Request the first chunk with correct parameters
+        socket.emit("fs-start", { 
+          uid: metadata.senderUid,
+          sessionId: sessionId,
+          receiverId: receiverUID.current
+        });
+      });
+
+      // Handle file chunks
+      socket.on("fs-share", (data) => {
+        if (!data || !data.buffer) {
+          console.error("Missing buffer in fs-share event");
+          return;
+        }
+        
+        const { buffer, transferId, sessionId, chunkIndex, totalChunks, isLastChunk } = data;
+        const fileId = transferId || (sessionId && data.sessionId);
+        
+        console.log(`Received chunk ${chunkIndex + 1}/${totalChunks} for transfer ID: ${fileId}`);
+        
+        // Get the file state or create a new one if not found
+        if (!fileShare.current[fileId]) {
+          console.error(`No file state found for transfer ID: ${fileId}`);
+          return;
+        }
+        
+        const fileState = fileShare.current[fileId];
+        
+        // Process the chunk
+        const newTransmitted = fileState.transmitted + buffer.byteLength;
+        const newBuffer = [...fileState.buffer, buffer];
+        
+        // Update file state
+        fileShare.current[fileId] = {
+          ...fileState,
+          transmitted: newTransmitted,
+          buffer: newBuffer
+        };
+        
+        // Calculate progress
+        const progress = Math.round((newTransmitted / fileState.metadata.total_buffer_size) * 100);
+        console.log(`File progress: ${progress}% (${newTransmitted}/${fileState.metadata.total_buffer_size} bytes)`);
+        
+        // Update UI
+        updateTransferProgress({
+          transferId: fileId,
+          sentChunks: Math.ceil(newTransmitted / (fileState.metadata.buffer_size || 64 * 1024)),
+          totalChunks: Math.ceil(fileState.metadata.total_buffer_size / (fileState.metadata.buffer_size || 64 * 1024)),
+          receivedChunks: Math.ceil(newTransmitted / (fileState.metadata.buffer_size || 64 * 1024)),
+          status: newTransmitted === fileState.metadata.total_buffer_size || isLastChunk ? 'completed' : 'transferring',
+          metadata: {
+            id: fileId,
+            name: fileState.metadata.filename,
+            type: fileState.metadata.type || 'application/octet-stream',
+            size: fileState.metadata.total_buffer_size,
+            lastModified: Date.now()
+          }
+        });
+
+        // Handle file completion
+        if (newTransmitted === fileState.metadata.total_buffer_size || isLastChunk) {
+          console.log(`File transfer complete: ${fileState.metadata.filename}`);
+          
+          // Create blob from all chunks
+          const blob = new Blob(newBuffer, { 
+            type: fileState.metadata.type || 'application/octet-stream' 
+          });
+          
+          // Mark as completed
+          handleFileReceived(fileId, blob);
+          
+          // Notify sender of completion
+          socket.emit('transfer-complete', {
+            transferId: fileState.metadata.senderUid,
+            fileName: fileState.metadata.filename
+          });
+          
+          // Clean up this file's state
+          delete fileShare.current[fileId];
+        } else {
+          // Request next chunk with minimal delay and proper parameters
+          setTimeout(() => {
+            console.log(`Requesting next chunk for session ${fileState.sessionId}`);
+            socket.emit("fs-start", { 
+              uid: fileState.metadata.senderUid,
+              sessionId: fileState.sessionId,
+              receiverId: receiverUID.current
+            });
+          }, 10); // Minimal delay for faster transfers
+        }
       });
       
-      // Handle connection error
-      peer.on('error', (err) => {
-        console.error('Peer connection error:', err);
-        setError('Failed to connect to the sender. They may be offline.');
+      // Handle errors
+      socket.on('sender-not-found', () => {
+        console.error('Sender not found event received');
         setIsConnecting(false);
+        setReceiveState({
+          status: 'error',
+          error: 'Sender not found. The link may be invalid or the sender disconnected.'
+        });
       });
-    } catch (err) {
-      console.error('Error connecting to sender:', err);
-      setError('Failed to set up connection');
+      
+      // Set a timeout to detect connection failures
+      const connectionTimeout = setTimeout(() => {
+        if (isConnecting && !isConnected) {
+          console.error('Connection timed out');
+          setIsConnecting(false);
+          setReceiveState({
+            status: 'error',
+            error: 'Connection timed out. The sender may be offline.'
+          });
+        }
+      }, 15000); // 15 second timeout
+      
+      return () => {
+        clearTimeout(connectionTimeout);
+        socket.off("fs-meta");
+        socket.off("fs-share");
+        socket.off("sender-not-found");
+      };
+      
+    } catch (error) {
+      console.error('Error connecting to sender:', error);
       setIsConnecting(false);
+      setReceiveState({
+        status: 'error',
+        error: error instanceof Error ? error.message : String(error)
+      });
     }
-  };
-  
-  const downloadFile = (fileId: string) => {
+  }, [transferId, socket, user?.id, updateTransferProgress, handleFileReceived, isConnecting, isConnected]);
+
+  // Function to download a received file
+  const downloadFile = useCallback((fileId: string) => {
     const file = completedFiles.find(f => f.id === fileId);
     if (!file) return;
     
@@ -112,15 +330,48 @@ const ReceivePage: React.FC = () => {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     }, 100);
-  };
+  }, [completedFiles]);
   
-  const downloadAllFiles = () => {
-    // For multiple files, either create a zip or download them one by one
+  // Function to download all files
+  const downloadAllFiles = useCallback(() => {
     completedFiles.forEach(file => {
       downloadFile(file.id);
     });
-  };
+  }, [completedFiles, downloadFile]);
   
+  // Report connection status to server periodically to help with matching
+  useEffect(() => {
+    if (!socket || !transferId || !receiverUID.current) return;
+    
+    // Send periodic status updates to help with matching
+    const updateInterval = setInterval(() => {
+      socket.emit('receiver-status-update', {
+        transferId,
+        userId: user?.id || 'anonymous',
+        receiverUid: receiverUID.current,
+        timestamp: Date.now(),
+        connected: isConnected
+      });
+    }, 10000); // Every 10 seconds
+    
+    return () => clearInterval(updateInterval);
+  }, [socket, transferId, user?.id, isConnected]);
+
+  // Send heartbeat when connected
+  useEffect(() => {
+    if (isConnected && socket && transferId) {
+      // Send heartbeat
+      const heartbeatInterval = setInterval(() => {
+        socket.emit('receiver-heartbeat', {
+          transferId,
+          userId: user?.id || 'anonymous-user'
+        });
+      }, 5000);
+      
+      return () => clearInterval(heartbeatInterval);
+    }
+  }, [isConnected, socket, transferId, user?.id]);
+
   return (
     <div className="max-w-3xl mx-auto">
       <h1 className="text-2xl font-bold text-gray-900 dark:text-white mb-6">
@@ -150,13 +401,25 @@ const ReceivePage: React.FC = () => {
             : 'Connect to the sender to start receiving files. Your files will be transferred securely using end-to-end encryption.'}
         </p>
         
-        {!isConnected && !isConnecting && completedFiles.length === 0 && (
+        {receiveState.status === 'idle' && completedFiles.length === 0 && (
           <>
+            {urlTransferId === 'guest' && (
+              <div className="mb-4">
+                <Input
+                  label="Enter transfer code"
+                  value={transferCode}
+                  onChange={e => setTransferCode(e.target.value)}
+                  placeholder="Paste code here"
+                  fullWidth
+                />
+              </div>
+            )}
             <div className="flex justify-center mb-6">
               <Button
                 onClick={connectToSender}
                 size="lg"
                 leftIcon={<Shield size={18} />}
+                disabled={!transferId || !socket}
               >
                 Connect to Sender
               </Button>
@@ -169,7 +432,7 @@ const ReceivePage: React.FC = () => {
           </>
         )}
         
-        {isConnecting && (
+        {receiveState.status === 'connecting' && (
           <div className="text-center">
             <Loader size={32} className="mx-auto mb-4 animate-spin text-primary-500" />
             <p className="text-gray-600 dark:text-gray-400">
@@ -178,10 +441,10 @@ const ReceivePage: React.FC = () => {
           </div>
         )}
         
-        {error && (
+        {receiveState.status === 'error' && (
           <div className="mt-4 p-4 bg-error-50 dark:bg-error-900/20 text-error-600 dark:text-error-400 rounded-md flex items-center">
             <AlertTriangle size={20} className="mr-2 flex-shrink-0" />
-            <p>{error}</p>
+            <p>{receiveState.error}</p>
           </div>
         )}
       </div>

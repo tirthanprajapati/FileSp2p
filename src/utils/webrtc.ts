@@ -1,11 +1,8 @@
-// import PeerFactory, { Instance as PeerInstance } from 'simple-peer';
-// // simple‑peer ships as a CommonJS module when esModuleInterop is off,
-// // so grab the constructor off `.default` if it’s there
-// const Peer: typeof PeerFactory = (PeerFactory as { default?: typeof PeerFactory }).default || PeerFactory;
-import SimplePeer, { Instance as PeerInstance, SignalData } from 'simple-peer';
-const Peer = SimplePeer;
+import SimplePeer from 'simple-peer';
 import { Socket } from 'socket.io-client';
 import { v4 as uuidv4 } from 'uuid';
+
+export type PeerInstance = SimplePeer.Instance;
 
 export interface FileMetadata {
   id: string;
@@ -32,26 +29,110 @@ export interface TransferProgress {
   metadata?: FileMetadata;
 }
 
+export interface FileTransfer {
+  file: File;
+  status: 'preparing' | 'transferring' | 'completed' | 'error';
+  receiverId: string;
+  sentChunks: number;
+  totalChunks: number;
+}
+
 const CHUNK_SIZE = 16 * 1024; // 16KB chunks
 
 export function createPeer(
   initiator: boolean,
   socket: Socket,
-  roomId: string
-): PeerInstance {
-  const peer = new Peer({ initiator, trickle: true });
+  roomId: string,
+  userId: string // Add userId parameter
+): SimplePeer.Instance {
+  console.log(`Creating peer - initiator: ${initiator}, roomId: ${roomId}, userId: ${userId}`);
+  
+  try {
+    // Create the peer with explicit configuration
+    const peer = new SimplePeer({
+      initiator,
+      trickle: true,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:global.stun.twilio.com:3478' }
+        ]
+      }
+    });
 
-  // send our SDP/ICE out to the room
-  peer.on('signal', (signalData) => {
-    socket.emit('signal', { to: roomId, signal: signalData });
-  });
+    // Send signal with userId included
+    peer.on('signal', (signalData) => {
+      console.log(`Sending signal from ${userId} for room ${roomId}`, signalData.type);
+      socket.emit('signal', { 
+        to: roomId, 
+        from: userId, // Include userId
+        signal: signalData 
+      });
+    });
 
-  // accept all incoming signaling messages from the room
-  socket.on('signal', (data: { from: string; signal: SignalData }) => {
-    peer.signal(data.signal);
-  });
+    // Debug events
+    peer.on('connect', () => {
+      console.log(`Peer connection established for ${userId} in room ${roomId}`);
+      
+      // Emit connection confirmation to room
+      socket.emit('peer-connected', { 
+        room: roomId, 
+        userId: userId,
+        role: initiator ? 'sender' : 'receiver'
+      });
+      
+      // Send connection confirmation directly to peer
+      try {
+        peer.send(JSON.stringify({ 
+          type: 'connection-confirmed',
+          userId: userId,
+          role: initiator ? 'sender' : 'receiver'
+        }));
+      } catch (err) {
+        console.warn('Could not send connection confirmation:', err);
+      }
+    });
 
-  return peer;
+    peer.on('error', (err) => {
+      console.error(`Peer error for ${userId} in room ${roomId}:`, err);
+    });
+
+    // Handle incoming signals
+    socket.on('signal', (data) => {
+      console.log(`Received signal for room ${roomId} from ${data.from}`, data.signal.type);
+      
+      if (data && data.signal && typeof peer.signal === 'function') {
+        try {
+          peer.signal(data.signal);
+        } catch (err) {
+          console.error('Error processing signal:', err);
+        }
+      }
+    });
+    
+    // Listen for the peer-connected event for the room
+    socket.on('peer-connected', (data) => {
+      if (data.room === roomId && data.userId !== userId) {
+        console.log(`Peer ${data.userId} (${data.role}) connected to room ${roomId}`);
+        
+        // Dispatch a custom event that components can listen for
+        const event = new CustomEvent('peerConnectionStatus', {
+          detail: { 
+            connected: true,
+            peerId: data.userId,
+            role: data.role,
+            roomId: roomId
+          }
+        });
+        window.dispatchEvent(event);
+      }
+    });
+
+    return peer;
+  } catch (error) {
+    console.error('Error creating peer:', error);
+    throw error;
+  }
 }
 
 export async function prepareFileForTransfer(file: File): Promise<{ 
@@ -166,6 +247,17 @@ export function setupFileReceiver(
       try {
         const message = JSON.parse(data);
         
+        // Handle connection-confirmed message
+        if (message.type === 'connection-confirmed') {
+          console.log(`Connection confirmed by ${message.role} (${message.userId})`);
+          // Dispatch event to notify components
+          const event = new CustomEvent('peerConnectionConfirmed', {
+            detail: { userId: message.userId, role: message.role }
+          });
+          window.dispatchEvent(event);
+          return;
+        }
+        
         if (message.type === 'metadata') {
           // Initialize a new transfer
           const { transferId, metadata } = message;
@@ -185,6 +277,12 @@ export function setupFileReceiver(
             status: 'transferring',
             metadata,
           });
+          
+          // Send acknowledgment back to sender
+          peer.send(JSON.stringify({
+            type: 'metadata-received',
+            transferId
+          }));
         } else if (message.type === 'chunk-header') {
           // Prepare to receive the next chunk of data
           const { transferId, chunkIndex } = message;
@@ -240,4 +338,164 @@ export function setupFileReceiver(
       }
     }
   });
+}
+
+export function setupFileSender(
+  peer: PeerInstance,
+  userId: string // Add userId parameter
+): {
+  sendFile: (file: File, receiverId: string) => Promise<string>;
+  cancelTransfer: (transferId: string) => void;
+} {
+  const transfers = new Map<string, FileTransfer>();
+  
+  // Listen for data from the peer
+  peer.on('data', (data) => {
+    if (typeof data === 'string') {
+      try {
+        const message = JSON.parse(data);
+        
+        // Handle connection confirmation
+        // Handle connection confirmation
+        if (message.type === 'connection-confirmed') {
+          console.log(`Connection confirmed by receiver (${message.userId})`);
+          
+          // Dispatch event to notify components
+          const event = new CustomEvent('peerConnectionConfirmed', {
+            detail: { userId: message.userId }
+          });
+          window.dispatchEvent(event);
+          
+          // Resume any waiting transfers
+          transfers.forEach((transfer, id) => {
+            if (transfer.status === 'preparing') {
+              console.log(`Resuming transfer ${id} after connection confirmed`);
+              sendNextChunk(id);
+            }
+          });
+        }
+        
+        // Handle metadata acknowledgment
+        if (message.type === 'metadata-received') {
+          const { transferId } = message;
+          console.log(`Metadata received confirmation for transfer ${transferId}`);
+          
+          const transfer = transfers.get(transferId);
+          if (transfer && transfer.status === 'preparing') {
+            console.log(`Starting to send chunks for transfer ${transferId}`);
+            transfer.status = 'transferring';
+            sendNextChunk(transferId);
+          }
+        }
+      } catch (err) {
+        console.error('Error parsing message from peer:', err);
+      }
+    }
+  });
+  
+  // Send file function
+  const sendFile = async (file: File, receiverId: string): Promise<string> => {
+    // Create a unique transfer ID
+    const transferId = uuidv4();
+    
+    // Store transfer information
+    transfers.set(transferId, {
+      file,
+      status: 'preparing',
+      receiverId,
+      sentChunks: 0,
+      totalChunks: Math.ceil(file.size / CHUNK_SIZE)
+    });
+    
+    // Send file metadata first with more robust identification info
+    peer.send(JSON.stringify({
+      type: 'file-metadata',
+      transferId,
+      metadata: {
+        name: file.name,
+        type: file.type,
+        size: file.size
+      },
+      receiverId, // Include the receiver's ID
+      senderUid: userId, // Include sender ID for fallback matching
+      timestamp: Date.now(), // Add timestamp for logging/debugging
+      socketReceiverId: receiverId // Ensure consistent format
+    }));
+    
+    // Start sending chunks
+    await sendNextChunk(transferId);
+    
+    return transferId;
+  };
+  
+  // Cancel transfer function
+  const cancelTransfer = (transferId: string): void => {
+    // Implement cancel logic here
+    if (transfers.has(transferId)) {
+      transfers.delete(transferId);
+    }
+  };
+
+  async function sendNextChunk(transferId: string): Promise<void> {
+    const transfer = transfers.get(transferId);
+    
+    if (!transfer) {
+      throw new Error(`Transfer with ID ${transferId} not found`);
+    }
+    
+    // Update status to transferring if it's still preparing
+    if (transfer.status === 'preparing') {
+      transfer.status = 'transferring';
+    }
+    
+    // Check if there are more chunks to send
+    if (transfer.sentChunks < transfer.totalChunks) {
+      try {
+        // Calculate chunk position
+        const start = transfer.sentChunks * CHUNK_SIZE;
+        const end = Math.min(transfer.file.size, start + CHUNK_SIZE);
+        
+        // Get chunk data
+        const chunkData = await transfer.file.slice(start, end).arrayBuffer();
+        
+        // Send chunk header
+        peer.send(JSON.stringify({
+          type: 'file-chunk',
+          transferId,
+          chunkIndex: transfer.sentChunks,
+          totalChunks: transfer.totalChunks,
+          receiverId: transfer.receiverId,
+          senderUid: userId, // Include sender ID for better matching
+          timestamp: Date.now() // Add timestamp for tracking
+        }));
+        
+        // Send the binary data
+        peer.send(chunkData);
+        
+        // Update sent chunks count
+        transfer.sentChunks++;
+        
+        // If there are more chunks to send, schedule the next one
+        if (transfer.sentChunks < transfer.totalChunks) {
+          // Small delay to prevent overwhelming the connection
+          setTimeout(() => sendNextChunk(transferId), 10);
+        } else {
+          // All chunks sent, update status
+          transfer.status = 'completed';
+          console.log(`File transfer ${transferId} completed`);
+        }
+        
+        return Promise.resolve();
+      } catch (error) {
+        console.error(`Error sending chunk for transfer ${transferId}:`, error);
+        transfer.status = 'error';
+        throw error;
+      }
+    }
+  }
+
+  return {
+    sendFile,
+    cancelTransfer
+  };
 }

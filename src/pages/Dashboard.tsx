@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { Send, Download, Clock, FileText, ExternalLink, FileIcon } from 'lucide-react';
+import { Send, Download, Clock, FileText, ExternalLink } from 'lucide-react';
 import Button from '../components/ui/Button';
 import { useAuth } from '../context/AuthContext';
-import api from '../utils/api';
 
 interface Transfer {
   id: string;
@@ -29,57 +28,16 @@ const Dashboard: React.FC = () => {
     const fetchTransfers = async () => {
       try {
         setLoading(true);
-        // This would be a real API call in a production app
-        // const response = await api.get('/transfers');
-        // setTransfers(response.data);
+        // Fetch transfers from API endpoint
+        // Replace this with your actual API implementation
+        const response = await fetch('/api/transfers');
         
-        // Mock data for demonstration
-        const mockTransfers: Transfer[] = [
-          {
-            id: '1',
-            fileName: 'project-presentation.pptx',
-            fileType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-            fileSize: 2500000,
-            status: 'completed',
-            type: 'sent',
-            recipientEmail: 'colleague@example.com',
-            createdAt: '2025-06-10T14:30:00Z',
-            completedAt: '2025-06-10T14:32:00Z',
-          },
-          {
-            id: '2',
-            fileName: 'financial-report-q2.xlsx',
-            fileType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            fileSize: 1800000,
-            status: 'completed',
-            type: 'received',
-            senderEmail: 'manager@example.com',
-            createdAt: '2025-06-09T09:15:00Z',
-            completedAt: '2025-06-09T09:17:00Z',
-          },
-          {
-            id: '3',
-            fileName: 'contract-draft.pdf',
-            fileType: 'application/pdf',
-            fileSize: 4200000,
-            status: 'pending',
-            type: 'sent',
-            recipientEmail: 'legal@example.com',
-            createdAt: '2025-06-11T11:45:00Z',
-          },
-          {
-            id: '4',
-            fileName: 'product-designs.zip',
-            fileType: 'application/zip',
-            fileSize: 15000000,
-            status: 'failed',
-            type: 'received',
-            senderEmail: 'designer@example.com',
-            createdAt: '2025-06-08T16:20:00Z',
-          },
-        ];
+        if (!response.ok) {
+          throw new Error('Failed to fetch transfers');
+        }
         
-        setTransfers(mockTransfers);
+        const data = await response.json();
+        setTransfers(data);
       } catch (err) {
         setError('Failed to load transfer history');
         console.error('Error fetching transfers:', err);

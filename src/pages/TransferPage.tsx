@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Link as LinkIcon, CheckCircle, Copy, Zap } from 'lucide-react';
 import Button from '../components/ui/Button';
 import Input from '../components/ui/Input';
@@ -6,7 +6,7 @@ import FileDropZone from '../components/transfer/FileDropZone';
 import TransferProgress from '../components/transfer/TransferProgress';
 import { useAuth } from '../context/AuthContext';
 import { useSocket } from '../context/SocketContext';
-import { prepareFileForTransfer, sendFileViaPeer, createPeer, TransferProgress as TransferProgressType } from '../utils/webrtc';
+import { TransferProgress as TransferProgressType } from '../utils/webrtc';
 import { v4 as uuidv4 } from 'uuid';
 
 const TransferPage: React.FC = () => {
@@ -14,13 +14,272 @@ const TransferPage: React.FC = () => {
   const { socket, connected } = useSocket();
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [recipientEmail, setRecipientEmail] = useState('');
-  const [transferId, setTransferId] = useState<string>('');
   const [shareUrl, setShareUrl] = useState<string>('');
   const [transfers, setTransfers] = useState<TransferProgressType[]>([]);
   const [isCreatingLink, setIsCreatingLink] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
   
+  // Store cached file chunks to avoid re-reading files
+  const fileChunksCache = useRef<Map<string, Uint8Array[]>>(new Map());
+  
+  // Store one sender UID for this session
+  const senderUidRef = useRef<string>('');
+  
+  // Define updateTransferProgress before using it in memoizedProcessFilesForTransfer
+  const updateTransferProgress = useCallback((progress: TransferProgressType) => {
+    setTransfers(prevTransfers => {
+      // Find if this transfer already exists in our array
+      const existingIndex = prevTransfers.findIndex(
+        t => t.transferId === progress.transferId
+      );
+      
+      if (existingIndex >= 0) {
+        // Update existing transfer
+        const updatedTransfers = [...prevTransfers];
+        updatedTransfers[existingIndex] = progress;
+        return updatedTransfers;
+      } else {
+        // Add new transfer to the array
+        return [...prevTransfers, progress];
+      }
+    });
+  }, []);
+
+  // Read file as chunks and cache them for efficient transfer
+  const prepareFileChunks = useCallback(async (file: File, chunkSize: number = 64 * 1024) => {
+    const cacheKey = `${file.name}-${file.size}-${file.lastModified}`;
+    
+    // Check if we already have the chunks cached
+    if (fileChunksCache.current.has(cacheKey)) {
+      console.log(`Using cached chunks for ${file.name}`);
+      return fileChunksCache.current.get(cacheKey) as Uint8Array[];
+    }
+    
+    console.log(`Reading file ${file.name} as chunks`);
+    const chunks: Uint8Array[] = [];
+    let offset = 0;
+    
+    while (offset < file.size) {
+      const chunk = file.slice(offset, offset + chunkSize);
+      const buffer = await chunk.arrayBuffer();
+      chunks.push(new Uint8Array(buffer));
+      offset += chunkSize;
+    }
+    
+    // Cache the chunks for later use
+    fileChunksCache.current.set(cacheKey, chunks);
+    return chunks;
+  }, []);
+
+  // Improved file transfer implementation
+  const transferFile = useCallback(async (
+    file: File, 
+    receiverId: string, 
+    sessionId: string,
+    transferId: string
+  ) => {
+    if (!socket) {
+      throw new Error("Socket connection not available");
+    }
+    
+    console.log(`Starting file transfer for ${file.name} to receiver ${receiverId}`);
+    
+    // Create transfer progress record
+    const transferProgress: TransferProgressType = {
+      transferId,
+      sentChunks: 0,
+      totalChunks: Math.ceil(file.size / (64 * 1024)), // 64KB chunks
+      receivedChunks: 0,
+      status: 'waiting',
+      metadata: {
+        id: transferId,
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        lastModified: file.lastModified,
+      },
+    };
+    
+    // Update UI with initial progress
+    updateTransferProgress(transferProgress);
+    
+    try {
+      // Prepare file chunks
+      const chunks = await prepareFileChunks(file);
+      console.log(`Prepared ${chunks.length} chunks for file ${file.name}`);
+      
+      // Send file metadata to start the process
+      socket.emit("fs-meta", {
+        filename: file.name,
+        total_buffer_size: file.size,
+        buffer_size: 64 * 1024,
+        receiverId,
+        senderUid: sessionId,
+        sessionId,
+        transferId,
+        userId: user?.id || 'anonymous',
+        type: file.type
+      });
+      
+      console.log(`Sent metadata for file ${file.name}, waiting for fs-start events`);
+      
+      // Interface for fs-start event data
+      interface FsStartData {
+        sessionId: string;
+        uid?: string;
+        receiverId?: string;
+      }
+
+      // Set up handler for start requests
+      const handleFsStart = (data: FsStartData) => {
+        console.log(`Received fs-start event:`, data);
+        
+        // Verify this is for our session
+        if (data.sessionId !== sessionId) {
+          console.log(`Ignoring fs-start for different session ID: ${data.sessionId}`);
+          return;
+        }
+        
+        // Find the requested chunk index
+        const currentIndex = transferProgress.sentChunks;
+        console.log(`Sending chunk ${currentIndex + 1}/${chunks.length} for ${file.name}`);
+        
+        // Check if we've sent all chunks
+        if (currentIndex >= chunks.length) {
+          // We're done with this file
+          console.log(`All chunks sent for ${file.name}`);
+          updateTransferProgress({
+            ...transferProgress,
+            status: 'completed',
+            sentChunks: chunks.length,
+            totalChunks: chunks.length
+          });
+          
+          // Clean up this handler
+          socket.off('fs-start', handleFsStart);
+          return;
+        }
+        
+        // Get the next chunk
+        const chunk = chunks[currentIndex];
+        
+        // Send the chunk
+        socket.emit("fs-share", {
+          buffer: chunk,
+          senderUid: sessionId,
+          receiverId,
+          sessionId,
+          chunkIndex: currentIndex,
+          totalChunks: chunks.length,
+          transferId,
+          isLastChunk: currentIndex === chunks.length - 1
+        });
+        
+        // Update transfer progress
+        const newSentChunks = currentIndex + 1;
+        updateTransferProgress({
+          ...transferProgress,
+          sentChunks: newSentChunks,
+          status: newSentChunks === chunks.length ? 'completed' : 'transferring'
+        });
+        
+        // Update the reference for next time
+        transferProgress.sentChunks = newSentChunks;
+      };
+      
+      // Handle error responses
+      interface ReceiverNotFoundData {
+        transferId: string;
+      }
+      
+      const handleReceiverNotFound = (data: ReceiverNotFoundData) => {
+        console.log(`Receiver not found for transfer ${data.transferId}`);
+        if (data.transferId === transferId) {
+          updateTransferProgress({
+            ...transferProgress,
+            status: 'error',
+            error: 'Receiver disconnected or not found'
+          });
+          socket.off('fs-start', handleFsStart);
+          socket.off('receiver-not-found', handleReceiverNotFound);
+        }
+      };
+      
+      // Listen for start events and receiver errors
+      socket.on('fs-start', handleFsStart);
+      socket.on('receiver-not-found', handleReceiverNotFound);
+      
+      // Return a cleanup function
+      return () => {
+        socket.off('fs-start', handleFsStart);
+        socket.off('receiver-not-found', handleReceiverNotFound);
+      };
+    } catch (err) {
+      console.error(`Error transferring file ${file.name}:`, err);
+      updateTransferProgress({
+        ...transferProgress,
+        status: 'error',
+        error: err instanceof Error ? err.message : 'Unknown error'
+      });
+    }
+  }, [socket, prepareFileChunks, updateTransferProgress, user?.id]);
+
+  // Enhanced function to process files for transfer
+  const processFilesForTransfer = useCallback((receiverId: string) => {
+    console.log("Processing files for transfer to receiver:", receiverId);
+    
+    if (!socket) {
+      setError('Socket connection not available');
+      return;
+    }
+    
+    // Generate a unique session ID for this transfer batch
+    const sessionId = senderUidRef.current || uuidv4();
+    
+    // Process each file sequentially
+    const transferFiles = async () => {
+      for (const file of selectedFiles) {
+        // Create a unique ID for this specific file transfer
+        const fileTransferId = `${file.name}-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+        
+        // Start the transfer
+        await transferFile(file, receiverId, sessionId, fileTransferId);
+      }
+    };
+    
+    // Start the transfers
+    transferFiles().catch(err => {
+      console.error("Error during file transfers:", err);
+      setError(`Transfer error: ${err.message || 'Unknown error'}`);
+    });
+  }, [socket, selectedFiles, transferFile]);
+
+  useEffect(() => {
+    if (!socket) return;
+    
+    // Register sender with the server
+    senderUidRef.current = uuidv4();
+    socket.emit('sender-join', { 
+      uid: senderUidRef.current,
+      userId: user?.id || 'anonymous',
+      files: selectedFiles.map(f => ({ name: f.name, size: f.size, type: f.type }))
+    });
+    console.log('Registered sender with UID:', senderUidRef.current);
+
+    // Listen for receiver connections
+    const handleReceiverInit = (receiverData: { socketId?: string, uid?: string }) => {
+      console.log('Receiver connected:', receiverData);
+      // Don't auto-start transfer, wait for the user to click "Start Transfer"
+    };
+    
+    socket.on('init', handleReceiverInit);
+
+    return () => {
+      socket.off('init', handleReceiverInit);
+    };
+  }, [socket, user?.id, selectedFiles]);
+
   // Reset copy success message after 2 seconds
   useEffect(() => {
     if (copySuccess) {
@@ -33,6 +292,9 @@ const TransferPage: React.FC = () => {
   
   const handleFileSelect = (files: File[]) => {
     setSelectedFiles(files);
+    // Reset share URL and transfers when files change
+    setShareUrl('');
+    setTransfers([]);
   };
   
   const generateShareLink = async () => {
@@ -50,34 +312,39 @@ const TransferPage: React.FC = () => {
     setError(null);
     
     try {
-      // Generate a unique ID for this transfer
-      const newTransferId = uuidv4();
-      setTransferId(newTransferId);
+      // Use the existing sender UID
+      const transferId = senderUidRef.current;
       
-      // In a real app, we'd register this transfer with the server
-      // socket.emit('create_transfer', { transferId: newTransferId, fileInfo: ... });
-      
-      // Create a shareable URL
-      const url = `${window.location.origin}/receive/${newTransferId}`;
+      // Create a shareable URL with the sender UID
+      const url = `${window.location.origin}/receive/${transferId}`;
       setShareUrl(url);
       
+      // Reset transfers to avoid duplicates
+      setTransfers([]);
+      
       // Add metadata to transfer object
-      const initialTransfers: TransferProgressType[] = selectedFiles.map(file => ({
-        transferId: uuidv4(),
-        sentChunks: 0,
-        totalChunks: Math.ceil(file.size / (16 * 1024)), // 16KB chunks
-        receivedChunks: 0,
-        status: 'waiting',
-        metadata: {
-          id: uuidv4(),
-          name: file.name,
-          type: file.type,
-          size: file.size,
-          lastModified: file.lastModified,
-        },
-      }));
+      const initialTransfers: TransferProgressType[] = selectedFiles.map(file => {
+        const uniqueId = `${file.name}-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+        return {
+          transferId: uniqueId,
+          sentChunks: 0,
+          totalChunks: Math.ceil(file.size / (64 * 1024)), // 64KB chunks
+          receivedChunks: 0,
+          status: 'waiting',
+          metadata: {
+            id: uniqueId,
+            name: file.name,
+            type: file.type,
+            size: file.size,
+            lastModified: file.lastModified,
+          },
+        };
+      });
       
       setTransfers(initialTransfers);
+      
+      console.log('Created share link with sender UID:', transferId);
+      console.log('Share URL:', url);
     } catch (err) {
       console.error('Error creating share link:', err);
       setError('Failed to create share link');
@@ -91,80 +358,83 @@ const TransferPage: React.FC = () => {
     setCopySuccess(true);
   };
   
-  const updateTransferProgress = (progress: TransferProgressType) => {
-    setTransfers(prevTransfers => 
-      prevTransfers.map(transfer => 
-        transfer.transferId === progress.transferId ? progress : transfer
-      )
-    );
-  };
-  
-  const startTransfer = async () => {
+  // Function to handle starting the transfer process after link generation
+  const startTransfer = () => {
     if (!socket || !connected) {
       setError('Socket connection not available');
       return;
     }
     
-    if (selectedFiles.length === 0) {
-      setError('Please select at least one file');
-      return;
-    }
+    console.log("Starting transfer process with sender UID:", senderUidRef.current);
     
-    try {
-      // Signal the server that we're ready to connect to a peer
-      socket.emit('ready_to_connect', { transferId, senderId: user?.id });
+    // Check if we have any receivers connected
+    socket.emit('check-receivers', { senderUid: senderUidRef.current }, (response: { hasReceivers: boolean; receiverId: string }) => {
+      console.log("Receiver check response:", response);
       
-      // Create a WebRTC peer (as initiator)
-      const peer = createPeer(true, socket, transferId);
-      
-      // When the connection is established
-      peer.on('connect', async () => {
-        console.log('Peer connection established');
+      if (response && response.hasReceivers && response.receiverId) {
+        // Start transferring to the connected receiver
+        console.log("Connected receiver found, initiating transfer to:", response.receiverId);
+        processFilesForTransfer(response.receiverId);
+      } else {
+        console.log("No connected receivers found, waiting for connections...");
+        // Automatically wait for receiver connections
+        socket.once('init', (receiverData: { socketId?: string; uid?: string }) => {
+          console.log("Receiver connected during wait:", receiverData);
+          const receiverId = receiverData.socketId || receiverData.uid;
+          if (receiverId) {
+            processFilesForTransfer(receiverId);
+          } else {
+            setError('No valid receiver ID found');
+          }
+        });
         
-        // Process each file
-        for (const file of selectedFiles) {
-          // Prepare the file for transfer (split into chunks)
-          const { metadata, chunks } = await prepareFileForTransfer(file);
-          
-          // Send the file over the peer connection
-          sendFileViaPeer(peer, metadata, chunks, updateTransferProgress);
-        }
-      });
-      
-      // Update all transfers to 'connecting' status
-      setTransfers(prevTransfers => 
-        prevTransfers.map(transfer => ({
+        // Update UI to show waiting state
+        setTransfers(prev => prev.map(transfer => ({
           ...transfer,
-          status: 'connecting',
-        }))
-      );
-    } catch (err) {
-      console.error('Error starting transfer:', err);
-      setError('Failed to start transfer');
-      
-      // Update all transfers to 'error' status
-      setTransfers(prevTransfers => 
-        prevTransfers.map(transfer => ({
-          ...transfer,
-          status: 'error',
-          error: 'Connection failed',
-        }))
-      );
-    }
+          status: 'waiting'
+        })));
+      }
+    });
   };
   
   const handleRetry = (transferId: string) => {
-    // In a real implementation, we would reinitiate just that specific transfer
-    console.log('Retrying transfer:', transferId);
+    // Find the corresponding file
+    const transfer = transfers.find(t => t.transferId === transferId);
+    if (!transfer || !transfer.metadata) return;
     
-    // For demo, we'll just reset the status
-    setTransfers(prevTransfers => 
-      prevTransfers.map(transfer => 
-        transfer.transferId === transferId 
-          ? { ...transfer, status: 'waiting', error: undefined } 
-          : transfer
-      )
-    );
+    // Find the file by name
+    const file = selectedFiles.find(f => f.name === transfer.metadata?.name);
+    if (!file) return;
+    
+    // Reset transfer status
+    updateTransferProgress({
+      ...transfer,
+      status: 'waiting',
+      sentChunks: 0,
+      receivedChunks: 0,
+      error: undefined
+    });
+    
+    // Check if socket exists before using it
+    if (!socket) {
+      setError('Socket connection not available');
+      return;
+    }
+    
+    // Retry the transfer
+    socket.once('init', (receiverData: { socketId?: string; uid?: string }) => {
+      const receiverId = receiverData.socketId || receiverData.uid;
+      if (receiverId) {
+        transferFile(
+          file, 
+          receiverId, 
+          senderUidRef.current, 
+          transferId
+        );
+      } else {
+        setError('No valid receiver ID found');
+      }
+    });
   };
   
   return (
@@ -266,13 +536,18 @@ const TransferPage: React.FC = () => {
           </h2>
           
           <div className="space-y-4">
-            {transfers.map((transfer) => (
-              <TransferProgress
-                key={transfer.transferId}
-                transfer={transfer}
-                onRetry={() => handleRetry(transfer.transferId)}
-              />
-            ))}
+            {/* Use a more unique key and filter out duplicates based on filename */}
+            {transfers
+              .filter((transfer, index, self) => 
+                index === self.findIndex(t => t.metadata?.name === transfer.metadata?.name)
+              )
+              .map((transfer) => (
+                <TransferProgress
+                  key={transfer.transferId}
+                  transfer={transfer}
+                  onRetry={() => handleRetry(transfer.transferId)}
+                />
+              ))}
           </div>
         </div>
       )}
@@ -281,3 +556,4 @@ const TransferPage: React.FC = () => {
 };
 
 export default TransferPage;
+

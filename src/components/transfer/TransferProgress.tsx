@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { CheckCircle, AlertTriangle, Clock, RefreshCw } from 'lucide-react';
 import { TransferProgress as TransferProgressType } from '../../utils/webrtc';
 import Button from '../ui/Button';
@@ -15,14 +15,53 @@ const TransferProgress: React.FC<TransferProgressProps> = ({
   onCancel,
 }) => {
   const { sentChunks, totalChunks, receivedChunks, status, metadata } = transfer;
+  const [displayStatus, setDisplayStatus] = useState(status);
+  
+  // Add timeout to prevent stale "waiting" status
+  useEffect(() => {
+    // Update local display status when transfer status changes
+    setDisplayStatus(status);
+    
+    // If status is 'waiting' or 'connecting', set a timeout to transition to 'transferring'
+    // after a reasonable wait time - this helps prevent UI getting stuck
+    let timer: NodeJS.Timeout | null = null;
+    
+    if (status === 'waiting' || status === 'connecting') {
+      timer = setTimeout(() => {
+        // If there's been progress but UI shows waiting/connecting, force update to transferring
+        if ((sentChunks > 0 || receivedChunks > 0) && 
+            (displayStatus === 'waiting' || displayStatus === 'connecting')) {
+          setDisplayStatus('transferring');
+        }
+      }, 5000); // 5 second timeout
+    }
+    
+    return () => {
+      if (timer) clearTimeout(timer);
+    };
+  }, [status, sentChunks, receivedChunks, displayStatus]);
   
   // Calculate percentage for sender or receiver based on available data
-  const percentage = status === 'waiting' || status === 'connecting'
+  const percentage = displayStatus === 'waiting' || displayStatus === 'connecting'
     ? 0
-    : sentChunks > 0
+    : sentChunks > 0 && totalChunks > 0
       ? Math.round((sentChunks / totalChunks) * 100)
-      : Math.round((receivedChunks / totalChunks) * 100);
+      : receivedChunks > 0 && totalChunks > 0
+        ? Math.round((receivedChunks / totalChunks) * 100)
+        : receivedChunks > 0 && metadata?.size
+          ? Math.round((receivedChunks / Math.ceil(metadata.size / 16384)) * 100)
+          : 0;
   
+  // Ensure percentage is within bounds and never shows 0% when transferring has started
+  const displayPercentage = displayStatus === 'transferring' && percentage === 0 ? 1 : Math.min(100, Math.max(0, percentage));
+
+  // When one chunk received but status still shows waiting, force update status display
+  useEffect(() => {
+    if ((receivedChunks > 0 || sentChunks > 0) && displayStatus === 'waiting') {
+      setDisplayStatus('transferring');
+    }
+  }, [receivedChunks, sentChunks, displayStatus]);
+
   const formatFileSize = (bytes: number): string => {
     if (bytes === 0) return '0 Bytes';
     
@@ -35,7 +74,7 @@ const TransferProgress: React.FC<TransferProgressProps> = ({
   
   // Status icon and color
   const getStatusInfo = () => {
-    switch (status) {
+    switch (displayStatus) {
       case 'completed':
         return {
           icon: <CheckCircle className="h-6 w-6 text-success-500" />,
@@ -94,12 +133,12 @@ const TransferProgress: React.FC<TransferProgressProps> = ({
       <div className="mt-3">
         <div className="flex justify-between text-xs mb-1">
           <span>{statusInfo.text}</span>
-          <span>{percentage}%</span>
+          <span>{displayPercentage}%</span>
         </div>
         <div className="h-2 w-full bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
           <div
             className={`h-full ${statusInfo.color} transition-all duration-300 ease-in-out`}
-            style={{ width: `${percentage}%` }}
+            style={{ width: `${displayPercentage}%` }}
           />
         </div>
       </div>
