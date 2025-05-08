@@ -14,6 +14,10 @@ export const api = axios.create({
   },
   withCredentials: true,
 });
+
+// List of public paths that should never redirect on auth failure
+const publicPaths = ['/', '/receive'];
+
 api.interceptors.response.use(
   (res) => res,
   (err) => {
@@ -25,10 +29,12 @@ api.interceptors.response.use(
     //  • it's not a 401
     //  • we're already on /login
     //  • this request was the login call itself
+    //  • we're on a public path
     if (
       status === 401 &&
       path !== '/login' &&
-      !reqUrl.endsWith('/auth/login')
+      !reqUrl.endsWith('/auth/login') &&
+      !publicPaths.some(publicPath => path === publicPath || path.startsWith(publicPath + '/'))
     ) {
       window.location.href = '/login';
     }

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useState, useEffect } from 'react';
 import { api } from '../utils/api';
 
 interface User {
@@ -35,8 +35,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setUser(response.data.user);
         }
       } catch (err) {
-        // Not authenticated, that's okay
-        console.log('Not authenticated');
+        // Not authenticated, silently handle this without redirects
+        console.log('Not authenticated, continuing as guest user');
+        setUser(null);
       } finally {
         setLoading(false);
       }
