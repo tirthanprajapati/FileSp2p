@@ -10,5 +10,25 @@ export default defineConfig({
   },
   define: {
     global: 'window'
+  },
+  build: {
+    // Increase the warning limit to 1000KB (1MB)
+    chunkSizeWarningLimit: 1000,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // Split vendor chunks
+          'vendor-react': ['react', 'react-dom', 'react-router-dom'],
+          'vendor-ui': ['lucide-react'],
+          'vendor-utils': ['uuid', 'socket.io-client', 'simple-peer'],
+          // Split app by features
+          'feature-transfer': [
+            './src/components/transfer/FileDropZone.tsx',
+            './src/components/transfer/TransferProgress.tsx',
+            './src/utils/webrtc.ts'
+          ]
+        }
+      }
+    }
   }
 });
